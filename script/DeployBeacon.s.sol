@@ -18,7 +18,7 @@ contract DeployBeaconScript is CREATE3Script {
                 getCreate3ContractSalt("VeBeacon"),
                 bytes.concat(
                     type(VeBeacon).creationCode,
-                    abi.encode(getCreate3Contract("VotingEscrow"), getCreate3Contract("VeRecipient"))
+                    abi.encode(vm.envAddress("VOTING_ESCROW"), getCreate3Contract("VeRecipient"))
                 )
             )
         );
