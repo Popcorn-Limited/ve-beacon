@@ -11,3 +11,5 @@ out/
 .env
 
 .vscode
+
+.DS_STORE
