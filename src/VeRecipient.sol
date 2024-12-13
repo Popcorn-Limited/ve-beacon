@@ -1,27 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0
 pragma solidity ^0.8.4;
 
-import {CrossChainEnabled} from "openzeppelin-contracts/contracts/crosschain/CrossChainEnabled.sol";
-
+import {OApp, Origin, MessagingFee} from "@layerzerolabs/oapp-evm/contracts/oapp/OApp.sol";
 import "./base/Structs.sol";
-import {BoringOwnable} from "./base/BoringOwnable.sol";
 
 /// @title VeRecipient
-/// @author zefram.eth
-/// @notice Recipient on non-Ethereum networks that receives data from the Ethereum beacon
+/// @author Vaultcraft
+/// @notice Recipient on non-Ethereum networks that receives data from the Ethereum beacon via layerzero
 /// and makes vetoken balances available on this network.
-abstract contract VeRecipient is CrossChainEnabled, BoringOwnable {
+contract VeRecipientLZ is OApp {
     /// -----------------------------------------------------------------------
     /// Errors
     /// -----------------------------------------------------------------------
-
     error VeRecipient__InvalidInput();
+    error InvalidSender();
 
     /// -----------------------------------------------------------------------
     /// Events
     /// -----------------------------------------------------------------------
 
     event UpdateVeBalance(address indexed user);
+    event SetEndPoint(address indexed layerZeroEndPoint);
     event SetBeacon(address indexed newBeacon);
 
     /// -----------------------------------------------------------------------
@@ -34,7 +33,8 @@ abstract contract VeRecipient is CrossChainEnabled, BoringOwnable {
     /// Storage variables
     /// -----------------------------------------------------------------------
 
-    address public beacon;
+    address public beacon; // main chain beacon contract
+
     mapping(address => Point) public userData;
     Point public globalData;
     mapping(uint256 => int128) public slopeChanges;
@@ -43,8 +43,13 @@ abstract contract VeRecipient is CrossChainEnabled, BoringOwnable {
     /// Constructor
     /// -----------------------------------------------------------------------
 
-    constructor(address beacon_, address owner_) BoringOwnable(owner_) {
+    constructor(
+        address layerZeroEndPoint_,
+        address beacon_,
+        address owner_
+    ) OApp(layerZeroEndPoint_, owner_) {
         beacon = beacon_;
+        emit SetEndPoint(layerZeroEndPoint_);
         emit SetBeacon(beacon_);
     }
 
@@ -52,22 +57,58 @@ abstract contract VeRecipient is CrossChainEnabled, BoringOwnable {
     /// Crosschain functions
     /// -----------------------------------------------------------------------
 
-    /// @notice Called by VeBeacon from Ethereum via bridge to update vetoken balance & supply info.
-    function updateVeBalance(
-        address user,
-        int128 userBias,
-        int128 userSlope,
-        uint256 userTs,
-        int128 globalBias,
-        int128 globalSlope,
-        uint256 globalTs,
-        SlopeChange[] calldata slopeChanges_
-    ) external onlyCrossChainSender(beacon) {
+    // @notice LayerZero endpoint will invoke this function to deliver the message on the destination
+    // @param _origin A struct containing information about where the packet came from.
+    // @param _guid A global unique identifier for tracking the packet.
+    // @param payload Encoded message.
+    function _lzReceive(
+        Origin calldata origin,
+        bytes32 guid,
+        bytes calldata payload,
+        address executor,
+        bytes calldata extraData
+    ) internal override {
+        if (msg.sender != address(endpoint)) revert InvalidSender();
+
+        if (address(uint160(uint256(origin.sender))) != beacon)
+            revert InvalidSender();
+
+        _updateVeBalance(payload);
+    }
+
+    function _updateVeBalance(bytes calldata payload) internal {
+        (
+            address user,
+            int128 userBias,
+            int128 userSlope,
+            uint256 userTs,
+            int128 globalBias,
+            int128 globalSlope,
+            uint256 globalTs,
+            SlopeChange[] memory slopeChanges_
+        ) = abi.decode(
+                payload,
+                (
+                    address,
+                    int128,
+                    int128,
+                    uint256,
+                    int128,
+                    int128,
+                    uint256,
+                    SlopeChange[]
+                )
+            );
+
         userData[user] = Point({bias: userBias, slope: userSlope, ts: userTs});
-        globalData = Point({bias: globalBias, slope: globalSlope, ts: globalTs});
+        globalData = Point({
+            bias: globalBias,
+            slope: globalSlope,
+            ts: globalTs
+        });
 
         uint256 slopeChangesLength = slopeChanges_.length;
-        for (uint256 i; i < slopeChangesLength;) {
+        for (uint256 i; i < slopeChangesLength; ) {
             slopeChanges[slopeChanges_[i].ts] = slopeChanges_[i].change;
 
             unchecked {
@@ -83,7 +124,7 @@ abstract contract VeRecipient is CrossChainEnabled, BoringOwnable {
     /// -----------------------------------------------------------------------
 
     /// @notice Called by owner to update the beacon address.
-    /// @dev The beacon address needs to be updateable because VeBeacon needs to be redeployed
+    /// @dev The beacon address needs to be updateable because beacon needs to be redeployed
     /// when support for a new network is added.
     /// @param newBeacon The new address
     function setBeacon(address newBeacon) external onlyOwner {
@@ -106,7 +147,9 @@ abstract contract VeRecipient is CrossChainEnabled, BoringOwnable {
         Point memory u = userData[user];
 
         // compute vetoken balance
-        int256 veBalance = u.bias - u.slope * int128(int256(block.timestamp - u.ts));
+        int256 veBalance = u.bias -
+            u.slope *
+            int128(int256(block.timestamp - u.ts));
         if (veBalance < 0) veBalance = 0;
         return uint256(veBalance);
     }
@@ -121,7 +164,7 @@ abstract contract VeRecipient is CrossChainEnabled, BoringOwnable {
     function totalSupply() external view returns (uint256) {
         Point memory g = globalData;
         uint256 ti = (g.ts / (1 weeks)) * (1 weeks);
-        for (uint256 i; i < MAX_ITERATIONS;) {
+        for (uint256 i; i < MAX_ITERATIONS; ) {
             ti += 1 weeks;
             int128 slopeChange;
             if (ti > block.timestamp) {
@@ -148,13 +191,18 @@ abstract contract VeRecipient is CrossChainEnabled, BoringOwnable {
     /// @dev Added for compatibility with kick() in gauge contracts.
     /// @param user The user's address
     /// @return The last update timestamp
-    function user_point_history__ts(address user, uint256 /*epoch*/ ) external view returns (uint256) {
+    function user_point_history__ts(
+        address user,
+        uint256 /*epoch*/
+    ) external view returns (uint256) {
         return userData[user].ts;
     }
 
     /// @notice Just returns 0.
     /// @dev Added for compatibility with kick() in gauge contracts.
-    function user_point_epoch(address /*user*/ ) external pure returns (uint256) {
+    function user_point_epoch(
+        address /*user*/
+    ) external pure returns (uint256) {
         return 0;
     }
 }
